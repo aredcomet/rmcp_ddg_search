@@ -56,7 +56,6 @@ The optimized executable will be located at:
 
 To integrate this server with your favorite MCP client (such as Cursor or Claude Desktop), add the server definition to your `mcp.json` (or `claude_desktop_config.json`) configuration file.
 
-Replace `/Users/bran/src/play/rmcp_ddg_search` with the absolute path to your project directory.
 
 ### Example `mcp.json` Configuration
 
@@ -64,7 +63,7 @@ Replace `/Users/bran/src/play/rmcp_ddg_search` with the absolute path to your pr
 {
   "mcpServers": {
     "ddg-search": {
-      "command": "/Users/bran/src/play/rmcp_ddg_search/target/release/rmcp_ddg_search",
+      "command": "<path_to_project_dir>/target/release/rmcp_ddg_search",
       "args": [
         "--transport",
         "stdio"
@@ -82,4 +81,4 @@ Replace `/Users/bran/src/play/rmcp_ddg_search` with the absolute path to your pr
 - **Claude Desktop**: 
   - MacOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-- **Cursor**: Configure directly in Cursor Settings -> Features -> MCP -> Add New MCP Server (Type: `command`, Command: `/Users/bran/src/play/rmcp_ddg_search/target/release/rmcp_ddg_search --transport stdio`).
+- **Cursor**: Configure directly in Cursor Settings -> Features -> MCP -> Add New MCP Server (Type: `command`, Command: `<path_to_project_dir>/target/release/rmcp_ddg_search --transport stdio`).
