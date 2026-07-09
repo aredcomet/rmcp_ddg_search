@@ -3,6 +3,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use std::path::Path;
+use std::process::Stdio;
+use tokio::process::Command;
 
 use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt, transport::stdio, Peer, RoleServer};
 use rmcp::handler::server::wrapper::{Parameters, Json};
@@ -191,6 +194,126 @@ impl DdgSearchServer {
             fetch_rate_limiter: RateLimiter::new(20),
         }
     }
+
+    async fn fetch_with_browser(&self, peer: &Peer<RoleServer>, url: &str) -> Result<(String, String), String> {
+        let mut targets = Vec::new();
+
+        // 1. Environment variable override
+        if let Ok(env_path) = std::env::var("FETCH_BROWSER_PATH") {
+            targets.push(("Env Override".to_string(), env_path));
+        }
+
+        // 2. OS-specific absolute paths
+        #[cfg(target_os = "macos")]
+        {
+            targets.push(("Brave Browser".to_string(), "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser".to_string()));
+            targets.push(("Google Chrome".to_string(), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string()));
+            targets.push(("Chromium".to_string(), "/Applications/Chromium.app/Contents/MacOS/Chromium".to_string()));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let prefixes = [
+                std::env::var("ProgramFiles").ok(),
+                std::env::var("ProgramFiles(x86)").ok(),
+                std::env::var("LocalAppData").ok(),
+            ];
+            let relative_paths = [
+                ("Brave Browser".to_string(), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+                ("Google Chrome".to_string(), "Google\\Chrome\\Application\\chrome.exe"),
+                ("Chromium".to_string(), "Chromium\\Application\\chrome.exe"),
+            ];
+            for prefix in prefixes.iter().flatten() {
+                for (name, rel_path) in &relative_paths {
+                    let path = Path::new(prefix).join(rel_path);
+                    if path.exists() {
+                        targets.push((name.clone(), path.to_string_lossy().into_owned()));
+                    }
+                }
+            }
+        }
+
+        // 3. Standard PATH commands (as fallbacks)
+        targets.extend(vec![
+            ("Brave Browser (PATH)".to_string(), "brave-browser".to_string()),
+            ("Brave Browser (PATH)".to_string(), "brave".to_string()),
+            ("Google Chrome (PATH)".to_string(), "google-chrome-stable".to_string()),
+            ("Google Chrome (PATH)".to_string(), "google-chrome".to_string()),
+            ("Chromium (PATH)".to_string(), "chromium-browser".to_string()),
+            ("Chromium (PATH)".to_string(), "chromium".to_string()),
+        ]);
+
+        let args = [
+            "--headless=new",
+            "--disable-gpu",
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1920,1080",
+            "--accept-lang=en-US,en;q=0.9",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--dump-dom",
+            url,
+        ];
+
+        for (name, target) in targets {
+            let is_valid = if target.contains('/') || target.contains('\\') {
+                Path::new(&target).exists()
+            } else {
+                true
+            };
+
+            if !is_valid {
+                continue;
+            }
+
+            send_log(peer, LoggingLevel::Info, format!("Attempting to fetch using {} ({})", name, target)).await;
+
+            let mut cmd = Command::new(&target);
+            cmd.args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+
+            let child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    send_log(peer, LoggingLevel::Info, format!("DEBUG: Failed to spawn {}: {}", name, e)).await;
+                    continue;
+                }
+            };
+
+            let timeout_duration = Duration::from_secs(25);
+            match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
+                Ok(Ok(output)) => {
+                    if output.status.success() {
+                        match String::from_utf8(output.stdout) {
+                            Ok(stdout) => {
+                                if !stdout.is_empty() {
+                                    return Ok((name, stdout));
+                                } else {
+                                    send_log(peer, LoggingLevel::Info, format!("DEBUG: {} returned empty output", name)).await;
+                                }
+                            }
+                            Err(e) => {
+                                send_log(peer, LoggingLevel::Info, format!("DEBUG: {} returned invalid UTF-8: {}", name, e)).await;
+                            }
+                        }
+                    } else {
+                        send_log(peer, LoggingLevel::Info, format!("DEBUG: {} exited with status: {:?}", name, output.status)).await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    send_log(peer, LoggingLevel::Info, format!("DEBUG: Error waiting for {}: {}", name, e)).await;
+                }
+                Err(_) => {
+                    send_log(peer, LoggingLevel::Info, format!("WARNING: Timeout elapsed waiting for {}", name)).await;
+                }
+            }
+        }
+
+        Err("No browser was able to successfully fetch and render the page".to_string())
+    }
 }
 
 // --- ServerHandler & Tool Definitions ---
@@ -340,44 +463,62 @@ impl DdgSearchServer {
 
         self.fetch_rate_limiter.acquire().await;
 
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => return format!("Error initializing HTTP client: {}", e),
-        };
+        let mut html = String::new();
+        let mut fetch_success = false;
 
-        let response = match client
-            .get(&params.url)
-            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                send_log(&peer, LoggingLevel::Error, format!("HTTP error occurred while fetching {}: {}", params.url, e)).await;
-                return format!("Error: Could not access the webpage ({})", e);
+        // Try fetching with a browser first
+        match self.fetch_with_browser(&peer, &params.url).await {
+            Ok((browser_name, content)) => {
+                send_log(&peer, LoggingLevel::Info, format!("Successfully fetched page with JS rendering using {}", browser_name)).await;
+                html = content;
+                fetch_success = true;
             }
-        };
+            Err(e) => {
+                send_log(&peer, LoggingLevel::Info, format!("WARNING: Browser fetch failed ({}), falling back to standard HTTP request", e)).await;
+            }
+        }
 
-        let response = match response.error_for_status() {
-            Ok(r) => r,
-            Err(e) => {
-                send_log(&peer, LoggingLevel::Error, format!("HTTP status error for {}: {}", params.url, e)).await;
-                return format!("Error: Could not access the webpage ({})", e);
-            }
-        };
+        // Fallback to reqwest if browser failed
+        if !fetch_success {
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return format!("Error initializing HTTP client: {}", e),
+            };
 
-        let html = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                send_log(&peer, LoggingLevel::Error, format!("Error reading response body from {}: {}", params.url, e)).await;
-                return format!("Error: Could not read the webpage content ({})", e);
-            }
-        };
+            let response = match client
+                .get(&params.url)
+                .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
+                .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    send_log(&peer, LoggingLevel::Error, format!("HTTP error occurred while fetching {}: {}", params.url, e)).await;
+                    return format!("Error: Could not access the webpage ({})", e);
+                }
+            };
+
+            let response = match response.error_for_status() {
+                Ok(r) => r,
+                Err(e) => {
+                    send_log(&peer, LoggingLevel::Error, format!("HTTP status error for {}: {}", params.url, e)).await;
+                    return format!("Error: Could not access the webpage ({})", e);
+                }
+            };
+
+            html = match response.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    send_log(&peer, LoggingLevel::Error, format!("Error reading response body from {}: {}", params.url, e)).await;
+                    return format!("Error: Could not read the webpage content ({})", e);
+                }
+            };
+        }
 
         let cleaned_text = clean_html(&html);
         let total_chars = cleaned_text.chars().count();
