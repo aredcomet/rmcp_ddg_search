@@ -458,12 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Read Default Region configuration from environment variables
     let default_region = std::env::var("DDG_REGION").unwrap_or_default();
-
-    // Log initialization settings to stderr (so as not to corrupt stdio transport on stdout)
-    eprintln!("DuckDuckGo MCP Server initialized:");
-    eprintln!("  SafeSearch: {}", safe_search.name());
-    eprintln!("  Default Region: {}", if default_region.is_empty() { "none" } else { &default_region });
-
+    
     // 4. Instantiate Server and start listening
     let server = DdgSearchServer::new(safe_search, default_region);
     let service = server.serve(stdio()).await?;
