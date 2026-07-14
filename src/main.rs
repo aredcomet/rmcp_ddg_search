@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use std::path::Path;
-use std::process::Stdio;
-use tokio::process::Command;
+use std::path::{Path, PathBuf};
+use futures::StreamExt;
+use chromiumoxide::{Browser, BrowserConfig};
 
 use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt, transport::stdio, Peer, RoleServer};
 use rmcp::handler::server::wrapper::{Parameters, Json};
@@ -233,6 +233,174 @@ fn clean_html(html: &str, url: Option<&str>) -> String {
     raw_text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+struct BrowserManager {
+    browser: Mutex<Option<Arc<Browser>>>,
+    user_data_dir: PathBuf,
+}
+
+fn which(cmd: &str) -> bool {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let p = dir.join(cmd);
+            if p.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn find_browser_path() -> Option<(String, String)> {
+    let mut targets = Vec::new();
+
+    if let Ok(env_path) = std::env::var("FETCH_BROWSER_PATH") {
+        targets.push(("Env Override".to_string(), env_path));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        targets.push(("Brave Browser".to_string(), "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser".to_string()));
+        targets.push(("Google Chrome".to_string(), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string()));
+        targets.push(("Chromium".to_string(), "/Applications/Chromium.app/Contents/MacOS/Chromium".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let prefixes = [
+            std::env::var("ProgramFiles").ok(),
+            std::env::var("ProgramFiles(x86)").ok(),
+            std::env::var("LocalAppData").ok(),
+        ];
+        let relative_paths = [
+            ("Brave Browser".to_string(), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+            ("Google Chrome".to_string(), "Google\\Chrome\\Application\\chrome.exe"),
+            ("Chromium".to_string(), "Chromium\\Application\\chrome.exe"),
+        ];
+        for prefix in prefixes.iter().flatten() {
+            for (name, rel_path) in &relative_paths {
+                let path = Path::new(prefix).join(rel_path);
+                if path.exists() {
+                    targets.push((name.clone(), path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+    }
+
+    targets.extend(vec![
+        ("Brave Browser (PATH)".to_string(), "brave-browser".to_string()),
+        ("Brave Browser (PATH)".to_string(), "brave".to_string()),
+        ("Google Chrome (PATH)".to_string(), "google-chrome-stable".to_string()),
+        ("Google Chrome (PATH)".to_string(), "google-chrome".to_string()),
+        ("Chromium (PATH)".to_string(), "chromium-browser".to_string()),
+        ("Chromium (PATH)".to_string(), "chromium".to_string()),
+    ]);
+
+    for (name, target) in targets {
+        let exists = if target.contains('/') || target.contains('\\') {
+            Path::new(&target).exists()
+        } else {
+            which(&target)
+        };
+
+        if exists {
+            return Some((name, target));
+        }
+    }
+
+    None
+}
+
+impl BrowserManager {
+    fn new() -> Self {
+        let pid = std::process::id();
+        let user_data_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!(".browser_profile_{}", pid));
+        Self {
+            browser: Mutex::new(None),
+            user_data_dir,
+        }
+    }
+
+    async fn get_or_launch_browser(&self, peer: Option<&Peer<RoleServer>>) -> Result<Arc<Browser>, String> {
+        let mut guard = self.browser.lock().await;
+        if let Some(ref browser) = *guard {
+            return Ok(browser.clone());
+        }
+
+        let (browser_name, executable_path) = find_browser_path()
+            .ok_or_else(|| "No Chrome, Brave, or Chromium browser was found on the system.".to_string())?;
+
+        send_log(peer, LoggingLevel::Info, format!("Launching persistent {} via CDP ({})", browser_name, executable_path)).await;
+
+        let config = BrowserConfig::builder()
+            .chrome_executable(executable_path)
+            .user_data_dir(self.user_data_dir.clone())
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--disable-dev-shm-usage")
+            .arg("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--window-size=1920,1080")
+            .arg("--accept-lang=en-US,en;q=0.9")
+            .build()
+            .map_err(|e| format!("Failed to build browser config: {}", e))?;
+
+        let (browser, mut handler) = Browser::launch(config).await
+            .map_err(|e| format!("Failed to launch browser: {}", e))?;
+
+        // Spawn background event handler loop
+        tokio::spawn(async move {
+            while let Some(h) = handler.next().await {
+                if h.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let browser_arc = Arc::new(browser);
+        *guard = Some(browser_arc.clone());
+        Ok(browser_arc)
+    }
+
+    async fn fetch_page(&self, peer: Option<&Peer<RoleServer>>, url: &str) -> Result<(String, String), String> {
+        let browser = self.get_or_launch_browser(peer).await?;
+        
+        send_log(peer, LoggingLevel::Info, format!("Opening tab for URL: {}", url)).await;
+        let page = match browser.new_page(url).await {
+            Ok(p) => p,
+            Err(e) => {
+                send_log(peer, LoggingLevel::Info, format!("Persistent browser connection failed: {}. Retrying launch...", e)).await;
+                {
+                    let mut guard = self.browser.lock().await;
+                    *guard = None;
+                }
+                let new_browser = self.get_or_launch_browser(peer).await?;
+                new_browser.new_page(url).await
+                    .map_err(|err| format!("Failed to open tab on retry: {}", err))?
+            }
+        };
+
+        // Wait for page navigation load event (max 15s)
+        let timeout_duration = Duration::from_secs(15);
+        if let Err(_) = tokio::time::timeout(timeout_duration, page.wait_for_navigation()).await {
+            send_log(peer, LoggingLevel::Info, "Timeout elapsed waiting for CDP page navigation load, proceeding with current content".to_string()).await;
+        }
+
+        // Sleep briefly to let SPAs load dynamic layout content
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let html = page.content().await
+            .map_err(|e| format!("Failed to extract DOM content: {}", e))?;
+
+        let _ = page.close().await;
+
+        let name = find_browser_path().map(|(n, _)| n).unwrap_or_else(|| "Headless Browser".to_string());
+        Ok((name, html))
+    }
+}
+
 // --- Server Struct ---
 
 #[derive(Clone)]
@@ -241,6 +409,7 @@ struct DdgSearchServer {
     default_region: String,
     search_rate_limiter: RateLimiter,
     fetch_rate_limiter: RateLimiter,
+    browser_manager: Arc<BrowserManager>,
 }
 
 impl DdgSearchServer {
@@ -250,127 +419,12 @@ impl DdgSearchServer {
             default_region,
             search_rate_limiter: RateLimiter::new(30),
             fetch_rate_limiter: RateLimiter::new(20),
+            browser_manager: Arc::new(BrowserManager::new()),
         }
     }
 
     async fn fetch_with_browser(&self, peer: Option<&Peer<RoleServer>>, url: &str) -> Result<(String, String), String> {
-        let mut targets = Vec::new();
-
-        // 1. Environment variable override
-        if let Ok(env_path) = std::env::var("FETCH_BROWSER_PATH") {
-            targets.push(("Env Override".to_string(), env_path));
-        }
-
-        // 2. OS-specific absolute paths
-        #[cfg(target_os = "macos")]
-        {
-            targets.push(("Brave Browser".to_string(), "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser".to_string()));
-            targets.push(("Google Chrome".to_string(), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string()));
-            targets.push(("Chromium".to_string(), "/Applications/Chromium.app/Contents/MacOS/Chromium".to_string()));
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let prefixes = [
-                std::env::var("ProgramFiles").ok(),
-                std::env::var("ProgramFiles(x86)").ok(),
-                std::env::var("LocalAppData").ok(),
-            ];
-            let relative_paths = [
-                ("Brave Browser".to_string(), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-                ("Google Chrome".to_string(), "Google\\Chrome\\Application\\chrome.exe"),
-                ("Chromium".to_string(), "Chromium\\Application\\chrome.exe"),
-            ];
-            for prefix in prefixes.iter().flatten() {
-                for (name, rel_path) in &relative_paths {
-                    let path = Path::new(prefix).join(rel_path);
-                    if path.exists() {
-                        targets.push((name.clone(), path.to_string_lossy().into_owned()));
-                    }
-                }
-            }
-        }
-
-        // 3. Standard PATH commands (as fallbacks)
-        targets.extend(vec![
-            ("Brave Browser (PATH)".to_string(), "brave-browser".to_string()),
-            ("Brave Browser (PATH)".to_string(), "brave".to_string()),
-            ("Google Chrome (PATH)".to_string(), "google-chrome-stable".to_string()),
-            ("Google Chrome (PATH)".to_string(), "google-chrome".to_string()),
-            ("Chromium (PATH)".to_string(), "chromium-browser".to_string()),
-            ("Chromium (PATH)".to_string(), "chromium".to_string()),
-        ]);
-
-        let args = [
-            "--headless=new",
-            "--disable-gpu",
-            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1920,1080",
-            "--accept-lang=en-US,en;q=0.9",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--dump-dom",
-            url,
-        ];
-
-        for (name, target) in targets {
-            let is_valid = if target.contains('/') || target.contains('\\') {
-                Path::new(&target).exists()
-            } else {
-                true
-            };
-
-            if !is_valid {
-                continue;
-            }
-
-            send_log(peer, LoggingLevel::Info, format!("Attempting to fetch using {} ({})", name, target)).await;
-
-            let mut cmd = Command::new(&target);
-            cmd.args(&args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-
-            let child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    send_log(peer, LoggingLevel::Info, format!("DEBUG: Failed to spawn {}: {}", name, e)).await;
-                    continue;
-                }
-            };
-
-            let timeout_duration = Duration::from_secs(25);
-            match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
-                Ok(Ok(output)) => {
-                    if output.status.success() {
-                        match String::from_utf8(output.stdout) {
-                            Ok(stdout) => {
-                                if !stdout.is_empty() {
-                                    return Ok((name, stdout));
-                                } else {
-                                    send_log(peer, LoggingLevel::Info, format!("DEBUG: {} returned empty output", name)).await;
-                                }
-                            }
-                            Err(e) => {
-                                send_log(peer, LoggingLevel::Info, format!("DEBUG: {} returned invalid UTF-8: {}", name, e)).await;
-                            }
-                        }
-                    } else {
-                        send_log(peer, LoggingLevel::Info, format!("DEBUG: {} exited with status: {:?}", name, output.status)).await;
-                    }
-                }
-                Ok(Err(e)) => {
-                    send_log(peer, LoggingLevel::Info, format!("DEBUG: Error waiting for {}: {}", name, e)).await;
-                }
-                Err(_) => {
-                    send_log(peer, LoggingLevel::Info, format!("WARNING: Timeout elapsed waiting for {}", name)).await;
-                }
-            }
-        }
-
-        Err("No browser was able to successfully fetch and render the page".to_string())
+        self.browser_manager.fetch_page(peer, url).await
     }
 }
 
@@ -729,7 +783,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("{}", html);
-        std::process::exit(0);
+        return Ok(());
     }
 
     // 5. Standalone test URL extraction mode
@@ -743,7 +797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match server.fetch_url_content_raw(None, &params).await {
             Ok(content) => {
                 println!("{}", content);
-                std::process::exit(0);
+                return Ok(());
             }
             Err(e) => {
                 eprintln!("Error fetching content: {}", e);

@@ -11,3 +11,5 @@ This file documents our progress in refining HTML extraction, boilerplate stripp
 | 2026-07-14 18:04:18 | Readability-only (with Pre-cleaning) | ThePrint (Nobel Laureate) | 1228.36 | 3.40 | 99.72% | 59315 / 545 | 78164 (99.08%) | 0.27% |
 
 | 2026-07-14 18:57:13 | Readability-only (Direct DOM, with Frontmatter) | ThePrint (Nobel Laureate) | 1041.29 | 2.68 | 99.74% | 49138 / 411 | 64807 (99.16%) | 0.25% |
+| 2026-07-14 19:18:12 | Readability-only (Persistent CDP Browser) | ThePrint (Nobel Laureate) | 1222.75 | 2.68 | 99.78% | 59013 / 411 | 77941 (99.30%) | 0.22% |
+
