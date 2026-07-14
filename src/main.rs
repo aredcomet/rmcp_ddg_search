@@ -678,6 +678,34 @@ impl DdgSearchServer {
 #[tool_handler(name = "ddg-search", version = "1.0.0")]
 impl ServerHandler for DdgSearchServer {}
 
+fn stop_all_headless_browsers(silent: bool) {
+    if !silent {
+        println!("Stopping all headless browser instances launched by this tool...");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let targets = ["Brave Browser", "Google Chrome", "Chromium", "chrome", "brave", "chromium"];
+        for target in &targets {
+            let pattern = format!("{}.*--headless.*browser_profile", target);
+            let _ = std::process::Command::new("pkill")
+                .args(&["-f", &pattern])
+                .status();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "brave.exe", "/FI", "WINDOWTITLE eq N/A"])
+            .status();
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "chrome.exe", "/FI", "WINDOWTITLE eq N/A"])
+            .status();
+    }
+    if !silent {
+        println!("Done.");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Argument parsing
@@ -685,6 +713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut transport = "stdio".to_string();
     let mut test_url = None;
     let mut test_raw = None;
+    let mut stop_browsers = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--transport" {
@@ -711,10 +740,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: --test-raw requires a value");
                 std::process::exit(1);
             }
+        } else if args[i] == "--stop-browsers" {
+            stop_browsers = true;
+            i += 1;
         } else {
             i += 1;
         }
     }
+
+    if stop_browsers {
+        stop_all_headless_browsers(false);
+        std::process::exit(0);
+    }
+
+    // Clean up any leaked headless browser instances silently on startup
+    stop_all_headless_browsers(true);
 
     // 2. Read SafeSearch configuration from environment variables
     let safe_search_mode_str = std::env::var("DDG_SAFE_SEARCH")
